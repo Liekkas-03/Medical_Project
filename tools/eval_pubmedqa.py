@@ -26,7 +26,10 @@ def normalize_label(text: str) -> str:
     if answer_match:
         return answer_match.group(1)
 
-    final_match = re.search(r"(?:final\s*decision|decision|answer)\s*[:\-]\s*(yes|no|maybe)\b", text)
+    final_match = re.search(
+        r"(?:final\s*decision|final\s*answer|decision|answer)\s*(?:is)?\s*[:\-]?\s*(yes|no|maybe)\b",
+        text,
+    )
     if final_match:
         return final_match.group(1)
 
@@ -66,11 +69,19 @@ def context_to_text(context, max_context_chars: int) -> str:
     return text
 
 
-def build_prompt(example: Dict, max_context_chars: int) -> str:
+def build_prompt(example: Dict, max_context_chars: int, prompt_style: str) -> str:
     question = str(example.get("question", "")).strip()
     context = context_to_text(example.get("context"), max_context_chars)
     if not question or not context:
         return ""
+    if prompt_style == "rationale":
+        return (
+            "Answer the biomedical research question using only the provided PubMed abstract context.\n"
+            "Give a brief evidence-based explanation, then end with exactly one line: "
+            "Final decision: yes/no/maybe.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question:\n{question}"
+        )
     return (
         "Answer the biomedical research question using only the provided PubMed abstract context.\n"
         "Choose exactly one final decision from: yes, no, maybe.\n"
@@ -115,9 +126,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_context_chars", type=int, default=2400)
-    parser.add_argument("--max_new_tokens", type=int, default=8)
+    parser.add_argument("--prompt_style", choices=("direct", "rationale"), default="direct")
+    parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--output_file", default="outputs/eval/pubmedqa_eval.jsonl")
     args = parser.parse_args()
+    max_new_tokens = args.max_new_tokens
+    if max_new_tokens is None:
+        max_new_tokens = 128 if args.prompt_style == "rationale" else 8
 
     dataset = load_dataset(args.dataset_name, args.dataset_config, split=args.split, cache_dir=args.cache_dir)
     dataset = dataset.shuffle(seed=args.seed)
@@ -141,7 +156,7 @@ def main():
     rows: List[Dict] = []
     prompts = []
     for example in dataset:
-        prompt = build_prompt(example, args.max_context_chars)
+        prompt = build_prompt(example, args.max_context_chars, args.prompt_style)
         gold = normalize_label(example.get("final_decision"))
         if prompt and gold:
             rows.append({
@@ -165,7 +180,7 @@ def main():
             with torch.inference_mode():
                 outputs = model.generate(
                     **inputs,
-                    max_new_tokens=args.max_new_tokens,
+                    max_new_tokens=max_new_tokens,
                     do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
@@ -201,6 +216,9 @@ def main():
         "macro_f1": macro_f1(golds, preds) if total else 0.0,
         "invalid": invalid,
         "invalid_rate": invalid / total if total else 0.0,
+        "prompt_style": args.prompt_style,
+        "max_new_tokens": max_new_tokens,
+        "seed": args.seed,
         "output_file": str(output_path),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
