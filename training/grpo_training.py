@@ -27,6 +27,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "FALSE"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 CHOICE_LETTERS = "ABCDEFG"
+PUBMEDQA_LABELS = ("yes", "no", "maybe")
 FORMAT_REWARD_VALUE = float(os.environ.get("FORMAT_REWARD_VALUE", "0.1"))
 
 
@@ -96,11 +97,42 @@ def is_choice_gold(text):
     return allowed == "" and len(compact) <= len(CHOICE_LETTERS)
 
 
+def normalize_label_answer(text):
+    """Normalize PubMedQA labels from plain text or <answer>...</answer>."""
+    text = extract_answer(text).strip().lower()
+    match = re.search(r"(?:final\s*decision|decision|answer)\s*[:\-]\s*(yes|no|maybe)\b", text)
+    if match:
+        return match.group(1)
+    if text in PUBMEDQA_LABELS:
+        return text
+    match = re.search(r"\b(yes|no|maybe)\b", text)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def is_label_gold(text):
+    """Return true for compact PubMedQA gold labels."""
+    text = extract_answer(text).strip().lower()
+    return text in PUBMEDQA_LABELS
+
+
 def accuracy_reward(completions, answer, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
     for content, sol in zip(contents, answer):
+        if is_label_gold(sol):
+            gold_label = normalize_label_answer(sol)
+            pred_label = normalize_label_answer(content)
+            reward = 1.0 if pred_label == gold_label else 0.0
+            logger.debug(
+                f"predict_answer: {content}, ground_truth: {sol}, "
+                f"pred_label: {pred_label}, gold_label: {gold_label}, reward: {reward}"
+            )
+            rewards.append(reward)
+            continue
+
         if is_choice_gold(sol):
             gold_choice = normalize_choice_answer(sol)
             pred_choice = normalize_choice_answer(content)
