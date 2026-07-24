@@ -16,11 +16,18 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.integrations import is_deepspeed_zero3_enabled
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, TrlParser
 from peft import LoraConfig, TaskType, get_peft_model
-from latex2sympy2_extended import NormalizationConfig
-from math_verify import LatexExtractionConfig, parse, verify
+try:
+    from latex2sympy2_extended import NormalizationConfig
+    from math_verify import LatexExtractionConfig, parse, verify
+    MATH_VERIFY_AVAILABLE = True
+except ImportError:
+    MATH_VERIFY_AVAILABLE = False
 
 os.environ["TOKENIZERS_PARALLELISM"] = "FALSE"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+CHOICE_LETTERS = "ABCDEFG"
+FORMAT_REWARD_VALUE = float(os.environ.get("FORMAT_REWARD_VALUE", "0.1"))
 
 
 @dataclass
@@ -62,10 +69,31 @@ def extract_answer(text):
     """Extract content between <answer> tags."""
     if text is None:
         return ""
-    match = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
+    match = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
     return text.strip()
+
+
+def normalize_choice_answer(text):
+    """Normalize choice answers like A, ABD, A、B, or <answer>AB</answer>."""
+    text = extract_answer(text).upper()
+    letters = re.findall(r"[A-G]", text)
+    if not letters:
+        return ""
+    return "".join(letter for letter in CHOICE_LETTERS if letter in set(letters))
+
+
+def is_choice_gold(text):
+    """Return true for compact multiple-choice gold answers."""
+    text = extract_answer(text).strip().upper()
+    if not text:
+        return False
+    compact = normalize_choice_answer(text)
+    if not compact:
+        return False
+    allowed = re.sub(r"[A-G,\s;:/()\[\]]", "", text)
+    return allowed == "" and len(compact) <= len(CHOICE_LETTERS)
 
 
 def accuracy_reward(completions, answer, **kwargs):
@@ -73,6 +101,22 @@ def accuracy_reward(completions, answer, **kwargs):
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
     for content, sol in zip(contents, answer):
+        if is_choice_gold(sol):
+            gold_choice = normalize_choice_answer(sol)
+            pred_choice = normalize_choice_answer(content)
+            reward = 1.0 if pred_choice == gold_choice else 0.0
+            logger.debug(
+                f"predict_answer: {content}, ground_truth: {sol}, "
+                f"pred_choice: {pred_choice}, gold_choice: {gold_choice}, reward: {reward}"
+            )
+            rewards.append(reward)
+            continue
+
+        if not MATH_VERIFY_AVAILABLE:
+            reward = 1.0 if normalize_text(extract_answer(content)) == normalize_text(str(sol)) else 0.0
+            rewards.append(reward)
+            continue
+
         if '####' in sol:
             # for GSM8K
             gold_parsed = parse(sol.split("####", 1)[-1].strip())
@@ -118,11 +162,11 @@ def accuracy_reward(completions, answer, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"<think>.*?</think><answer>.*?</answer>$"
+    pattern = r"^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$"
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content) for content in completion_contents]
+    matches = [re.match(pattern, content, re.DOTALL | re.IGNORECASE) for content in completion_contents]
 
-    rewards = [1.0 if match else 0.0 for match in matches]
+    rewards = [FORMAT_REWARD_VALUE if match else 0.0 for match in matches]
     logger.debug(f'format rewards: {rewards}')
     return rewards
 
