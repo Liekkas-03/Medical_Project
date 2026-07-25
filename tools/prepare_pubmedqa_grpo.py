@@ -62,6 +62,7 @@ def main():
     parser.add_argument("--split", default="train")
     parser.add_argument("--cache_dir", default=None)
     parser.add_argument("--max_samples", type=int, default=1000)
+    parser.add_argument("--skip_samples", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_context_chars", type=int, default=2400)
     parser.add_argument("--output_file", default="data/pubmedqa_grpo/train.jsonl")
@@ -69,8 +70,14 @@ def main():
 
     dataset = load_dataset(args.dataset_name, args.dataset_config, split=args.split, cache_dir=args.cache_dir)
     dataset = dataset.shuffle(seed=args.seed)
+    start = max(args.skip_samples, 0)
+    if start >= len(dataset):
+        raise ValueError(f"skip_samples={start} is outside dataset size {len(dataset)}")
     if args.max_samples and args.max_samples > 0:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+        end = min(start + args.max_samples, len(dataset))
+    else:
+        end = len(dataset)
+    dataset = dataset.select(range(start, end))
 
     output_path = Path(args.output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,7 +93,7 @@ def main():
             f.write("\n")
             count += 1
 
-    print(f"Saved {count} GRPO samples to {output_path}")
+    print(f"Saved {count} GRPO samples from shuffled range [{start}, {end}) to {output_path}")
 
 
 if __name__ == "__main__":
