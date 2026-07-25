@@ -21,26 +21,35 @@ def normalize_label(text: str) -> str:
     if text is None:
         return ""
     text = str(text).strip().lower()
+    return text if text in LABELS else ""
 
-    answer_match = re.search(r"<answer>\s*(yes|no|maybe)\s*</answer>", text, flags=re.DOTALL)
-    if answer_match:
-        return answer_match.group(1)
 
-    final_match = re.search(
-        r"(?:final\s*decision|final\s*answer|decision|answer)\s*(?:is)?\s*[:\-]?\s*(yes|no|maybe)\b",
+def extract_direct_label(text: str) -> str:
+    """Parse direct-mode output, where the whole response should be one label."""
+    if text is None:
+        return ""
+    text = str(text).strip().lower()
+    match = re.fullmatch(r"\s*(yes|no|maybe)\s*[\.。!！]?\s*", text)
+    return match.group(1) if match else ""
+
+
+def extract_final_decision_label(text: str) -> str:
+    """Parse rationale-mode output from the explicit final decision line only."""
+    if text is None:
+        return ""
+    text = str(text).strip().lower()
+    matches = re.findall(
+        r"\bfinal\s*decision\s*[:：\-]\s*(yes|no|maybe)\b",
         text,
+        flags=re.MULTILINE,
     )
-    if final_match:
-        return final_match.group(1)
+    return matches[-1] if matches else ""
 
-    stripped = re.sub(r"[^a-z]+", " ", text).strip()
-    if stripped in LABELS:
-        return stripped
 
-    first_match = re.search(r"\b(yes|no|maybe)\b", text)
-    if first_match:
-        return first_match.group(1)
-    return ""
+def extract_prediction_label(text: str, prompt_style: str) -> str:
+    if prompt_style == "rationale":
+        return extract_final_decision_label(text)
+    return extract_direct_label(text)
 
 
 def context_to_text(context, max_context_chars: int) -> str:
@@ -189,7 +198,7 @@ def main():
             decoded = tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=True)
 
             for row, raw_output in zip(batch_rows, decoded):
-                pred = normalize_label(raw_output)
+                pred = extract_prediction_label(raw_output, args.prompt_style)
                 invalid += int(pred == "")
                 golds.append(row["gold"])
                 preds.append(pred)
