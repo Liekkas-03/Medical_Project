@@ -261,6 +261,9 @@ def grpo_train(
         logger.info(f"Script parameters {script_args}")
         logger.info(f"Training parameters {training_args}")
 
+    trust_remote_code = getattr(model_args, "trust_remote_code", training_args.trust_remote_code)
+    attn_implementation = getattr(model_args, "attn_implementation", None)
+
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         (
@@ -269,7 +272,7 @@ def grpo_train(
             else model_args.model_name_or_path
         ),
         revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
+        trust_remote_code=trust_remote_code,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -358,12 +361,13 @@ def grpo_train(
 
     model_kwargs = dict(
         revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
-        attn_implementation=model_args.attn_implementation,
+        trust_remote_code=trust_remote_code,
         dtype=torch_dtype,
         low_cpu_mem_usage=(not is_deepspeed_zero3_enabled()),
         quantization_config=quantization_config,
     )
+    if attn_implementation:
+        model_kwargs["attn_implementation"] = attn_implementation
 
     num_gpus = torch.cuda.device_count()
     if ddp:
@@ -390,7 +394,7 @@ def grpo_train(
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(
             model_args.model_name_or_path,
-            trust_remote_code=model_args.trust_remote_code,
+            trust_remote_code=trust_remote_code,
             revision=model_args.model_revision,
         )
     except Exception:
