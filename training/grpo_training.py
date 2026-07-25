@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.integrations import is_deepspeed_zero3_enabled
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, TrlParser
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 try:
     from latex2sympy2_extended import NormalizationConfig
     from math_verify import LatexExtractionConfig, parse, verify
@@ -55,6 +55,10 @@ class ScriptArguments:
                                                      metadata={"help": "Number of workers for preprocessing"})
     # QLoRA arguments
     qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
+    peft_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional trainable PEFT adapter path to continue from, e.g. an SFT LoRA checkpoint."},
+    )
 
 
 def normalize_text(text):
@@ -98,23 +102,25 @@ def is_choice_gold(text):
 
 
 def normalize_label_answer(text):
-    """Normalize PubMedQA labels from plain text or <answer>...</answer>."""
-    text = extract_answer(text).strip().lower()
-    match = re.search(r"(?:final\s*decision|decision|answer)\s*[:\-]\s*(yes|no|maybe)\b", text)
-    if match:
-        return match.group(1)
-    if text in PUBMEDQA_LABELS:
-        return text
-    match = re.search(r"\b(yes|no|maybe)\b", text)
-    if match:
-        return match.group(1)
-    return ""
+    """Normalize plain PubMedQA gold labels."""
+    text = str(text or "").strip().lower()
+    return text if text in PUBMEDQA_LABELS else ""
+
+
+def extract_final_decision_label(text):
+    """Extract PubMedQA prediction only from an explicit final decision line."""
+    text = str(text or "").strip().lower()
+    matches = re.findall(
+        r"\bfinal\s*decision\s*[:：\-]\s*(yes|no|maybe)\b",
+        text,
+        flags=re.MULTILINE,
+    )
+    return matches[-1] if matches else ""
 
 
 def is_label_gold(text):
     """Return true for compact PubMedQA gold labels."""
-    text = extract_answer(text).strip().lower()
-    return text in PUBMEDQA_LABELS
+    return normalize_label_answer(text) != ""
 
 
 def accuracy_reward(completions, answer, **kwargs):
@@ -124,7 +130,7 @@ def accuracy_reward(completions, answer, **kwargs):
     for content, sol in zip(contents, answer):
         if is_label_gold(sol):
             gold_label = normalize_label_answer(sol)
-            pred_label = normalize_label_answer(content)
+            pred_label = extract_final_decision_label(content)
             reward = 1.0 if pred_label == gold_label else 0.0
             logger.debug(
                 f"predict_answer: {content}, ground_truth: {sol}, "
@@ -194,9 +200,9 @@ def accuracy_reward(completions, answer, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$"
+    pattern = r"(?is)^.+\n\s*final\s*decision\s*[:：\-]\s*(yes|no|maybe)\s*\.?\s*$"
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content, re.DOTALL | re.IGNORECASE) for content in completion_contents]
+    matches = [re.match(pattern, content) for content in completion_contents]
 
     rewards = [FORMAT_REWARD_VALUE if match else 0.0 for match in matches]
     logger.debug(f'format rewards: {rewards}')
@@ -205,9 +211,8 @@ def format_reward(completions, **kwargs):
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>"
+    "gives a brief evidence-based explanation, then ends with exactly one line in this format: "
+    "Final decision: yes/no/maybe"
 )
 
 
@@ -427,6 +432,9 @@ def grpo_train(
                 logger.info(f"  {name}: {param.device}")
                 break
 
+    if script_args.peft_path and not model_args.use_peft:
+        raise ValueError("--peft_path requires --use_peft True for trainable LoRA continuation.")
+
     # Configure LoRA if enabled
     if model_args.use_peft:
         if is_main_process:
@@ -434,20 +442,25 @@ def grpo_train(
         if training_args.gradient_checkpointing:
             logger.warning("Gradient checkpointing is enabled. It may cause issues with LoRA, setting it to False.")
             training_args.gradient_checkpointing = False
-        target_modules = model_args.lora_target_modules if model_args.lora_target_modules else None
-        if target_modules == 'all' or (target_modules and 'all' in target_modules):
-            target_modules = find_all_linear_names(model, int4=model_args.load_in_4bit, int8=model_args.load_in_8bit)
-        if is_main_process:
-            logger.info(f"Peft target_modules: {target_modules}, lora rank: {model_args.lora_r}, ")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            target_modules=target_modules,
-            inference_mode=False,
-            r=model_args.lora_r,
-            lora_alpha=model_args.lora_alpha,
-            lora_dropout=model_args.lora_dropout,
-        )
-        model = get_peft_model(model, peft_config)
+        if script_args.peft_path:
+            if is_main_process:
+                logger.info(f"Loading trainable PEFT adapter from {script_args.peft_path}")
+            model = PeftModel.from_pretrained(model, script_args.peft_path, is_trainable=True)
+        else:
+            target_modules = model_args.lora_target_modules if model_args.lora_target_modules else None
+            if target_modules == 'all' or (target_modules and 'all' in target_modules):
+                target_modules = find_all_linear_names(model, int4=model_args.load_in_4bit, int8=model_args.load_in_8bit)
+            if is_main_process:
+                logger.info(f"Peft target_modules: {target_modules}, lora rank: {model_args.lora_r}, ")
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                target_modules=target_modules,
+                inference_mode=False,
+                r=model_args.lora_r,
+                lora_alpha=model_args.lora_alpha,
+                lora_dropout=model_args.lora_dropout,
+            )
+            model = get_peft_model(model, peft_config)
         # Fixed FP16 ValueError for quantized models
         for param in filter(lambda p: p.requires_grad, model.parameters()):
             param.data = param.data.to(torch.float32)

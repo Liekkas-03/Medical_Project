@@ -48,8 +48,8 @@ def build_question(example, max_context_chars):
         return ""
     return (
         "Answer the biomedical research question using only the provided PubMed abstract context.\n"
-        "First provide brief reasoning inside <think>...</think>, then write exactly one label inside "
-        "<answer>...</answer>. The label must be one of: yes, no, maybe.\n\n"
+        "Give a brief evidence-based explanation, then end with exactly one line: "
+        "Final decision: yes/no/maybe.\n\n"
         f"Context:\n{context}\n\n"
         f"Question:\n{question}"
     )
